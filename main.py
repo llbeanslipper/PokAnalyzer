@@ -198,7 +198,7 @@ def require_active_subscription(user: User = Depends(get_current_user)):
 async def analyze(
     file: UploadFile = File(...),
     strategy: str = Form(...),
-    players: int = Form(...),
+    players: str = Form(...),  # <-- CHANGED FROM int TO str
     current_user: User = Depends(require_active_subscription)
 ):
     image_data = await file.read()
