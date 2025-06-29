@@ -16,25 +16,27 @@ from jose import JWTError, jwt
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import datetime, timedelta
 
-# Load environment variables
+# === ENVIRONMENT & API KEYS ===
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+SECRET_KEY = os.getenv("SECRET_KEY", "supersecretkey")  # Change in prod!
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
+# === FASTAPI APP & CORS ===
 app = FastAPI()
-
-# CORS config
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change to your frontend in production
+    allow_origins=["*"],  # Change to frontend origin(s) in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Database setup
+# === DATABASE ===
 DATABASE_URL = "sqlite:///./users.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 Base = declarative_base()
@@ -57,12 +59,8 @@ def get_db():
     finally:
         db.close()
 
-# Auth and JWT config
+# === AUTH & SECURITY ===
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-SECRET_KEY = "supersecretkey"  # Replace with secure random key in production
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
-
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 def verify_password(plain, hashed):
@@ -75,8 +73,7 @@ def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def get_user(db, email: str):
     return db.query(User).filter(User.email == email).first()
@@ -85,28 +82,29 @@ def get_user_by_customer_id(db, customer_id: str):
     return db.query(User).filter(User.stripe_customer_id == customer_id).first()
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: SessionLocal = Depends(get_db)):
-    print(f"Token received: {token}")
     credentials_exception = HTTPException(status_code=401, detail="Could not validate credentials")
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email = payload.get("sub")
-        print(f"Decoded email from token: {email}")
-        if email is None:
+        if not email:
             raise credentials_exception
-    except JWTError as e:
-        print(f"JWT decode error: {e}")
+    except JWTError:
         raise credentials_exception
     user = get_user(db, email=email)
-    print(f"User fetched from DB: {user}")
-    if user is None:
+    if not user:
         raise credentials_exception
     return user
 
-# User registration
+def require_active_subscription(user: User = Depends(get_current_user)):
+    if user.stripe_subscription_status != "active":
+        raise HTTPException(status_code=402, detail="Active subscription required.")
+    return user
+
+# === ROUTES ===
+
 @app.post("/register")
 def register(email: str = Form(...), password: str = Form(...), db: SessionLocal = Depends(get_db)):
-    user = get_user(db, email)
-    if user:
+    if get_user(db, email):
         raise HTTPException(status_code=400, detail="Email already registered")
     hashed_pw = get_password_hash(password)
     new_user = User(email=email, hashed_password=hashed_pw)
@@ -115,7 +113,6 @@ def register(email: str = Form(...), password: str = Form(...), db: SessionLocal
     db.refresh(new_user)
     return {"msg": "User registered!"}
 
-# User login
 @app.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: SessionLocal = Depends(get_db)):
     user = get_user(db, form_data.username)
@@ -127,7 +124,6 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: SessionLocal = D
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
-# Stripe checkout session
 @app.post("/create-checkout-session")
 def create_checkout_session(db: SessionLocal = Depends(get_db), current_user: User = Depends(get_current_user)):
     if not current_user.stripe_customer_id:
@@ -144,18 +140,14 @@ def create_checkout_session(db: SessionLocal = Depends(get_db), current_user: Us
     )
     return {"checkout_url": checkout_session.url}
 
-# Stripe webhook
 @app.post("/webhook")
 async def stripe_webhook(request: Request, db: SessionLocal = Depends(get_db)):
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
-    event = None
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-    except ValueError:
-        return JSONResponse(status_code=400, content={"error": "Invalid payload"})
-    except stripe.error.SignatureVerificationError:
-        return JSONResponse(status_code=400, content={"error": "Invalid signature"})
+    except (ValueError, stripe.error.SignatureVerificationError):
+        return JSONResponse(status_code=400, content={"error": "Invalid payload or signature"})
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
@@ -175,12 +167,6 @@ async def stripe_webhook(request: Request, db: SessionLocal = Depends(get_db)):
                 db.commit()
     return {"status": "success"}
 
-def require_active_subscription(user: User = Depends(get_current_user)):
-    if user.stripe_subscription_status != "active":
-        raise HTTPException(status_code=402, detail="Active subscription required.")
-    return user
-
-# Analyze endpoint
 @app.post("/analyze")
 async def analyze(
     file: UploadFile = File(...),
@@ -188,16 +174,14 @@ async def analyze(
     players: int = Form(...),
     current_user: User = Depends(require_active_subscription)
 ):
-    print(f"Received analyze request - file: {file.filename}, strategy: {strategy}, players: {players}")
-
     image_data = await file.read()
     try:
         image = Image.open(io.BytesIO(image_data))
+        image.verify()  # Validate image
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image file.")
 
     b64_image = base64.b64encode(image_data).decode()
-
     prompt = (
         "You are an expert poker assistant. "
         "Analyze the provided image of a poker table. Extract my hole cards, suits, community cards, stack sizes, bet amounts, and table situation. "
@@ -210,7 +194,6 @@ async def analyze(
         f"Assume {players} players at the table. "
         "If the image is unclear, make your best guess and say so in the reasoning, but ALWAYS give a decision and win %."
     )
-
     try:
         response = openai.chat.completions.create(
             model="gpt-4o",
@@ -229,7 +212,6 @@ async def analyze(
 
     return {"advice": answer}
 
-# Health check endpoints
 @app.get("/")
 def root():
     return {"message": "Pokanalyzer API is running."}
