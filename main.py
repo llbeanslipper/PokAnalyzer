@@ -1,19 +1,21 @@
 import os
-import io
-import base64
 import stripe
 import openai
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
+from PIL import Image
+import base64
+import io
+
+# === User Auth Imports ===
 from sqlalchemy import Column, Integer, String, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
-from PIL import Image
 
 # === ENV SETUP ===
 load_dotenv()
@@ -25,9 +27,10 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 # === FastAPI Setup ===
 app = FastAPI()
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Change to your frontend origin in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -45,7 +48,7 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     hashed_password = Column(String)
     stripe_customer_id = Column(String, unique=True, nullable=True)
-    stripe_subscription_status = Column(String, default="inactive")
+    stripe_subscription_status = Column(String, default="inactive")  # "active" or "inactive"
 
 Base.metadata.create_all(bind=engine)
 
@@ -58,16 +61,16 @@ def get_db():
 
 # === PASSWORD & JWT SETUP ===
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-SECRET_KEY = "supersecretkey"  # Change for production!
+SECRET_KEY = "supersecretkey"  # Change this to a strong random key for production!
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-def verify_password(plain, hashed):
+def verify_password(plain: str, hashed: str):
     return pwd_context.verify(plain, hashed)
 
-def get_password_hash(password):
+def get_password_hash(password: str):
     return pwd_context.hash(password)
 
 def create_access_token(data: dict, expires_delta: timedelta = None):
@@ -117,7 +120,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: SessionLocal = D
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     access_token = create_access_token(
-        data={"sub": user.email}, 
+        data={"sub": user.email},
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
     return {"access_token": access_token, "token_type": "bearer"}
@@ -126,11 +129,11 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: SessionLocal = D
 
 @app.post("/create-checkout-session")
 def create_checkout_session(db: SessionLocal = Depends(get_db), current_user: User = Depends(get_current_user)):
+    # Create Stripe customer if not exists
     if not current_user.stripe_customer_id:
         customer = stripe.Customer.create(email=current_user.email)
         current_user.stripe_customer_id = customer["id"]
         db.commit()
-
     checkout_session = stripe.checkout.Session.create(
         customer=current_user.stripe_customer_id,
         payment_method_types=["card"],
@@ -139,7 +142,7 @@ def create_checkout_session(db: SessionLocal = Depends(get_db), current_user: Us
             "quantity": 1,
         }],
         mode="subscription",
-        success_url="https://yourfrontend.com/success",
+        success_url="https://yourfrontend.com/success",  # Update these URLs to your frontend
         cancel_url="https://yourfrontend.com/cancel",
     )
     return {"checkout_url": checkout_session.url}
@@ -151,7 +154,9 @@ async def stripe_webhook(request: Request, db: SessionLocal = Depends(get_db)):
     event = None
 
     try:
-        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
     except ValueError:
         return JSONResponse(status_code=400, content={"error": "Invalid payload"})
     except stripe.error.SignatureVerificationError:
@@ -175,17 +180,14 @@ async def stripe_webhook(request: Request, db: SessionLocal = Depends(get_db)):
                 db.commit()
     return {"status": "success"}
 
-# === PAYWALL DECORATOR WITH ADMIN BYPASS ===
+# === PAYWALL DEPENDENCY ===
 
 def require_active_subscription(user: User = Depends(get_current_user)):
-    admin_email = "gem.bhakri@outlook.com"
-    if user.email == admin_email:
-        return user
     if user.stripe_subscription_status != "active":
         raise HTTPException(status_code=402, detail="Active subscription required.")
     return user
 
-# === PROTECTED ANALYZE ENDPOINT ===
+# === ANALYZE ENDPOINT ===
 
 @app.post("/analyze")
 async def analyze(
@@ -194,6 +196,9 @@ async def analyze(
     players: int = Form(...),
     current_user: User = Depends(require_active_subscription)
 ):
+    # Debug print to verify input received
+    print(f"Received analyze request - file: {file.filename}, strategy: {strategy}, players: {players}")
+
     image_data = await file.read()
     try:
         image = Image.open(io.BytesIO(image_data))
