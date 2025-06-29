@@ -9,7 +9,6 @@ from PIL import Image
 import base64
 import io
 
-# === User Auth Imports ===
 from sqlalchemy import Column, Integer, String, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from passlib.context import CryptContext
@@ -17,26 +16,25 @@ from jose import JWTError, jwt
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import datetime, timedelta
 
-# === ENV SETUP ===
+# Load environment variables
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-# === FastAPI Setup ===
 app = FastAPI()
 
-# CORS
+# CORS config
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change to your frontend origin in production
+    allow_origins=["*"],  # Change to your frontend in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# === DATABASE SETUP ===
+# Database setup
 DATABASE_URL = "sqlite:///./users.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 Base = declarative_base()
@@ -48,7 +46,7 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     hashed_password = Column(String)
     stripe_customer_id = Column(String, unique=True, nullable=True)
-    stripe_subscription_status = Column(String, default="inactive")  # "active" or "inactive"
+    stripe_subscription_status = Column(String, default="inactive")
 
 Base.metadata.create_all(bind=engine)
 
@@ -59,18 +57,18 @@ def get_db():
     finally:
         db.close()
 
-# === PASSWORD & JWT SETUP ===
+# Auth and JWT config
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-SECRET_KEY = "supersecretkey"  # Change this to a strong random key for production!
+SECRET_KEY = "supersecretkey"  # Replace with secure random key in production
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-def verify_password(plain: str, hashed: str):
+def verify_password(plain, hashed):
     return pwd_context.verify(plain, hashed)
 
-def get_password_hash(password: str):
+def get_password_hash(password):
     return pwd_context.hash(password)
 
 def create_access_token(data: dict, expires_delta: timedelta = None):
@@ -87,21 +85,24 @@ def get_user_by_customer_id(db, customer_id: str):
     return db.query(User).filter(User.stripe_customer_id == customer_id).first()
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: SessionLocal = Depends(get_db)):
+    print(f"Token received: {token}")
     credentials_exception = HTTPException(status_code=401, detail="Could not validate credentials")
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email = payload.get("sub")
+        print(f"Decoded email from token: {email}")
         if email is None:
             raise credentials_exception
-    except JWTError:
+    except JWTError as e:
+        print(f"JWT decode error: {e}")
         raise credentials_exception
     user = get_user(db, email=email)
+    print(f"User fetched from DB: {user}")
     if user is None:
         raise credentials_exception
     return user
 
-# === USER ENDPOINTS ===
-
+# User registration
 @app.post("/register")
 def register(email: str = Form(...), password: str = Form(...), db: SessionLocal = Depends(get_db)):
     user = get_user(db, email)
@@ -114,6 +115,7 @@ def register(email: str = Form(...), password: str = Form(...), db: SessionLocal
     db.refresh(new_user)
     return {"msg": "User registered!"}
 
+# User login
 @app.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: SessionLocal = Depends(get_db)):
     user = get_user(db, form_data.username)
@@ -125,11 +127,9 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: SessionLocal = D
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
-# === STRIPE PAYMENT ENDPOINTS ===
-
+# Stripe checkout session
 @app.post("/create-checkout-session")
 def create_checkout_session(db: SessionLocal = Depends(get_db), current_user: User = Depends(get_current_user)):
-    # Create Stripe customer if not exists
     if not current_user.stripe_customer_id:
         customer = stripe.Customer.create(email=current_user.email)
         current_user.stripe_customer_id = customer["id"]
@@ -137,26 +137,21 @@ def create_checkout_session(db: SessionLocal = Depends(get_db), current_user: Us
     checkout_session = stripe.checkout.Session.create(
         customer=current_user.stripe_customer_id,
         payment_method_types=["card"],
-        line_items=[{
-            "price": STRIPE_PRICE_ID,
-            "quantity": 1,
-        }],
+        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
         mode="subscription",
-        success_url="https://yourfrontend.com/success",  # Update these URLs to your frontend
+        success_url="https://yourfrontend.com/success",
         cancel_url="https://yourfrontend.com/cancel",
     )
     return {"checkout_url": checkout_session.url}
 
+# Stripe webhook
 @app.post("/webhook")
 async def stripe_webhook(request: Request, db: SessionLocal = Depends(get_db)):
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
     event = None
-
     try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, STRIPE_WEBHOOK_SECRET
-        )
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except ValueError:
         return JSONResponse(status_code=400, content={"error": "Invalid payload"})
     except stripe.error.SignatureVerificationError:
@@ -180,15 +175,12 @@ async def stripe_webhook(request: Request, db: SessionLocal = Depends(get_db)):
                 db.commit()
     return {"status": "success"}
 
-# === PAYWALL DEPENDENCY ===
-
 def require_active_subscription(user: User = Depends(get_current_user)):
     if user.stripe_subscription_status != "active":
         raise HTTPException(status_code=402, detail="Active subscription required.")
     return user
 
-# === ANALYZE ENDPOINT ===
-
+# Analyze endpoint
 @app.post("/analyze")
 async def analyze(
     file: UploadFile = File(...),
@@ -196,7 +188,6 @@ async def analyze(
     players: int = Form(...),
     current_user: User = Depends(require_active_subscription)
 ):
-    # Debug print to verify input received
     print(f"Received analyze request - file: {file.filename}, strategy: {strategy}, players: {players}")
 
     image_data = await file.read()
@@ -238,8 +229,7 @@ async def analyze(
 
     return {"advice": answer}
 
-# === TEST ENDPOINTS ===
-
+# Health check endpoints
 @app.get("/")
 def root():
     return {"message": "Pokanalyzer API is running."}
