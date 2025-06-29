@@ -1,12 +1,15 @@
 import os
+import stripe
 import openai
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from PIL import Image
 import base64
 import io
 
+# === User Auth Imports ===
 from sqlalchemy import Column, Integer, String, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from passlib.context import CryptContext
@@ -14,20 +17,15 @@ from jose import JWTError, jwt
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import datetime, timedelta
 
-# ENV SETUP
+# === ENV SETUP ===
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-# FastAPI Setup
+# === FastAPI Setup ===
 app = FastAPI()
-
-@app.get("/")
-def root():
-    return {"message": "PokAnalyzer backend is running!"}
-
-@app.get("/hello")
-def hello():
-    return {"msg": "Hello world from PokAnalyzer!"}
 
 # CORS
 app.add_middleware(
@@ -38,7 +36,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# DATABASE SETUP
+# === DATABASE SETUP ===
 DATABASE_URL = "sqlite:///./users.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 Base = declarative_base()
@@ -49,6 +47,8 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True)
     hashed_password = Column(String)
+    stripe_customer_id = Column(String, unique=True, nullable=True)
+    stripe_subscription_status = Column(String, default="inactive")  # "active" or "inactive"
 
 Base.metadata.create_all(bind=engine)
 
@@ -59,9 +59,9 @@ def get_db():
     finally:
         db.close()
 
-# PASSWORD & JWT SETUP
+# === PASSWORD & JWT SETUP ===
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-SECRET_KEY = "supersecretkey"  # CHANGE THIS in production!
+SECRET_KEY = "supersecretkey"  # Change for production!
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
@@ -83,6 +83,9 @@ def create_access_token(data: dict, expires_delta: timedelta = None):
 def get_user(db, email: str):
     return db.query(User).filter(User.email == email).first()
 
+def get_user_by_customer_id(db, customer_id: str):
+    return db.query(User).filter(User.stripe_customer_id == customer_id).first()
+
 def get_current_user(token: str = Depends(oauth2_scheme), db: SessionLocal = Depends(get_db)):
     credentials_exception = HTTPException(status_code=401, detail="Could not validate credentials")
     try:
@@ -97,7 +100,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: SessionLocal = Dep
         raise credentials_exception
     return user
 
-# USER ENDPOINTS
+# === USER ENDPOINTS ===
 
 @app.post("/register")
 def register(email: str = Form(...), password: str = Form(...), db: SessionLocal = Depends(get_db)):
@@ -122,14 +125,81 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: SessionLocal = D
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
-# PROTECTED ANALYZE ENDPOINT
+# === STRIPE PAYMENT ENDPOINTS ===
+
+@app.post("/create-checkout-session")
+def create_checkout_session(db: SessionLocal = Depends(get_db), current_user: User = Depends(get_current_user)):
+    # Create a customer in Stripe if not already present
+    if not current_user.stripe_customer_id:
+        customer = stripe.Customer.create(email=current_user.email)
+        current_user.stripe_customer_id = customer["id"]
+        db.commit()
+
+    checkout_session = stripe.checkout.Session.create(
+        customer=current_user.stripe_customer_id,
+        payment_method_types=["card"],
+        line_items=[{
+            "price": STRIPE_PRICE_ID,
+            "quantity": 1,
+        }],
+        mode="subscription",
+        success_url="https://yourfrontend.com/success",  # Update these URLs
+        cancel_url="https://yourfrontend.com/cancel",
+    )
+    return {"checkout_url": checkout_session.url}
+
+@app.post("/webhook")
+async def stripe_webhook(request: Request, db: SessionLocal = Depends(get_db)):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+    event = None
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except ValueError as e:
+        # Invalid payload
+        return JSONResponse(status_code=400, content={"error": "Invalid payload"})
+    except stripe.error.SignatureVerificationError as e:
+        # Invalid signature
+        return JSONResponse(status_code=400, content={"error": "Invalid signature"})
+
+    # Handle subscription events
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        customer_id = session.get("customer")
+        if customer_id:
+            user = get_user_by_customer_id(db, customer_id)
+            if user:
+                user.stripe_subscription_status = "active"
+                db.commit()
+    elif event["type"] == "customer.subscription.deleted":
+        subscription = event["data"]["object"]
+        customer_id = subscription.get("customer")
+        if customer_id:
+            user = get_user_by_customer_id(db, customer_id)
+            if user:
+                user.stripe_subscription_status = "inactive"
+                db.commit()
+    # Add other events as needed
+    return {"status": "success"}
+
+# === PAYWALL DECORATOR ===
+
+def require_active_subscription(user: User = Depends(get_current_user)):
+    if user.stripe_subscription_status != "active":
+        raise HTTPException(status_code=402, detail="Active subscription required.")
+    return user
+
+# === PROTECTED ANALYZE ENDPOINT ===
 
 @app.post("/analyze")
 async def analyze(
     file: UploadFile = File(...),
     strategy: str = Form(...),
     players: int = Form(...),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_active_subscription)
 ):
     image_data = await file.read()
     try:
@@ -169,3 +239,13 @@ async def analyze(
         raise HTTPException(status_code=500, detail=str(e))
 
     return {"advice": answer}
+
+# === TEST ENDPOINTS ===
+
+@app.get("/")
+def root():
+    return {"message": "Pokanalyzer API is running."}
+
+@app.get("/hello")
+def hello():
+    return {"hello": "world"}
