@@ -7,7 +7,6 @@ from PIL import Image
 import base64
 import io
 
-# === User Auth Imports ===
 from sqlalchemy import Column, Integer, String, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from passlib.context import CryptContext
@@ -15,27 +14,31 @@ from jose import JWTError, jwt
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import datetime, timedelta
 
-# === ENV SETUP ===
+# ENV SETUP
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# === FastAPI Setup ===
+# FastAPI Setup
 app = FastAPI()
 
 @app.get("/")
 def root():
     return {"message": "PokAnalyzer backend is running!"}
 
-# CORS (so your frontend can call this API from anywhere)
+@app.get("/hello")
+def hello():
+    return {"msg": "Hello world from PokAnalyzer!"}
+
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # For production, set to your frontend’s domain!
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# === DATABASE SETUP ===
+# DATABASE SETUP
 DATABASE_URL = "sqlite:///./users.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 Base = declarative_base()
@@ -56,9 +59,9 @@ def get_db():
     finally:
         db.close()
 
-# === PASSWORD & JWT SETUP ===
+# PASSWORD & JWT SETUP
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-SECRET_KEY = "supersecretkey"  # CHANGE THIS to something random in production!
+SECRET_KEY = "supersecretkey"  # CHANGE THIS in production!
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
@@ -94,7 +97,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: SessionLocal = Dep
         raise credentials_exception
     return user
 
-# === USER ENDPOINTS ===
+# USER ENDPOINTS
 
 @app.post("/register")
 def register(email: str = Form(...), password: str = Form(...), db: SessionLocal = Depends(get_db)):
@@ -119,7 +122,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: SessionLocal = D
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
-# === PROTECTED ANALYZE ENDPOINT ===
+# PROTECTED ANALYZE ENDPOINT
 
 @app.post("/analyze")
 async def analyze(
