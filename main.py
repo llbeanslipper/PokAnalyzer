@@ -1,20 +1,19 @@
 import os
 import io
 import base64
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends
+import stripe
+import openai
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import Column, Integer, String, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import datetime, timedelta
-from PIL import Image
-import openai
-import stripe
-from fastapi.responses import JSONResponse
-from fastapi.requests import Request
 from dotenv import load_dotenv
+from PIL import Image
 
 # === ENV SETUP ===
 load_dotenv()
@@ -26,7 +25,6 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 # === FastAPI Setup ===
 app = FastAPI()
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -60,9 +58,9 @@ def get_db():
 
 # === PASSWORD & JWT SETUP ===
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-SECRET_KEY = "supersecretkey"  # Replace with your own secret in production
+SECRET_KEY = "supersecretkey"  # Change for production!
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
@@ -153,9 +151,7 @@ async def stripe_webhook(request: Request, db: SessionLocal = Depends(get_db)):
     event = None
 
     try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, STRIPE_WEBHOOK_SECRET
-        )
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except ValueError:
         return JSONResponse(status_code=400, content={"error": "Invalid payload"})
     except stripe.error.SignatureVerificationError:
@@ -179,14 +175,17 @@ async def stripe_webhook(request: Request, db: SessionLocal = Depends(get_db)):
                 db.commit()
     return {"status": "success"}
 
-# === PAYWALL ===
+# === PAYWALL DECORATOR WITH ADMIN BYPASS ===
 
 def require_active_subscription(user: User = Depends(get_current_user)):
+    admin_email = "gem.bhakri@outlook.com"
+    if user.email == admin_email:
+        return user
     if user.stripe_subscription_status != "active":
         raise HTTPException(status_code=402, detail="Active subscription required.")
     return user
 
-# === ANALYZE ENDPOINT WITH DEBUG LOGS ===
+# === PROTECTED ANALYZE ENDPOINT ===
 
 @app.post("/analyze")
 async def analyze(
@@ -195,17 +194,10 @@ async def analyze(
     players: int = Form(...),
     current_user: User = Depends(require_active_subscription)
 ):
-    print(f"Received analyze request from user: {current_user.email}")
-    print(f"Strategy: {strategy}, Players: {players}")
-
     image_data = await file.read()
-    print(f"Received file {file.filename} with size {len(image_data)} bytes")
-
     try:
         image = Image.open(io.BytesIO(image_data))
-        print("Image opened successfully")
-    except Exception as e:
-        print(f"Error opening image: {e}")
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid image file.")
 
     b64_image = base64.b64encode(image_data).decode()
@@ -237,12 +229,11 @@ async def analyze(
         )
         answer = response.choices[0].message.content.strip()
     except Exception as e:
-        print(f"OpenAI error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
     return {"advice": answer}
 
-# === SIMPLE TEST ENDPOINTS ===
+# === TEST ENDPOINTS ===
 
 @app.get("/")
 def root():
