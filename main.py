@@ -1,14 +1,13 @@
 import os
-import stripe
-import openai
+import io
+import base64
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from PIL import Image
-import base64
-import io
 
+# Minimal database and user setup for protected endpoints:
 from sqlalchemy import Column, Integer, String, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from passlib.context import CryptContext
@@ -16,24 +15,20 @@ from jose import JWTError, jwt
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import datetime, timedelta
 
-# === ENV SETUP ===
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
-STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+SECRET_KEY = "supersecretkey"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
-# === FastAPI Setup ===
+# FastAPI app and CORS
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"]
 )
 
-# === DATABASE SETUP ===
+# Database (sqlite for testing)
 DATABASE_URL = "sqlite:///./users.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 Base = declarative_base()
@@ -45,8 +40,7 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     hashed_password = Column(String)
     stripe_customer_id = Column(String, unique=True, nullable=True)
-    stripe_subscription_status = Column(String, default="inactive")  # "active" or "inactive"
-
+    stripe_subscription_status = Column(String, default="inactive")
 Base.metadata.create_all(bind=engine)
 
 def get_db():
@@ -57,17 +51,10 @@ def get_db():
         db.close()
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-SECRET_KEY = "supersecretkey"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
-
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-def verify_password(plain, hashed):
-    return pwd_context.verify(plain, hashed)
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
+def verify_password(plain, hashed): return pwd_context.verify(plain, hashed)
+def get_password_hash(password): return pwd_context.hash(password)
 
 def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
@@ -78,9 +65,6 @@ def create_access_token(data: dict, expires_delta: timedelta = None):
 
 def get_user(db, email: str):
     return db.query(User).filter(User.email == email).first()
-
-def get_user_by_customer_id(db, customer_id: str):
-    return db.query(User).filter(User.stripe_customer_id == customer_id).first()
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: SessionLocal = Depends(get_db)):
     credentials_exception = HTTPException(status_code=401, detail="Could not validate credentials")
@@ -96,6 +80,39 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: SessionLocal = Dep
         raise credentials_exception
     return user
 
+@app.get("/")
+def root():
+    return {"message": "Pokanalyzer API is running."}
+
+@app.get("/hello")
+def hello():
+    return {"hello": "world"}
+
+# ====== TEST UPLOAD ENDPOINT FOR DEBUGGING ======
+@app.post("/test-upload")
+async def test_upload(file: UploadFile = File(...)):
+    """Debug endpoint: Accepts a file and returns its name and size."""
+    data = await file.read()
+    return {"filename": file.filename, "size": len(data)}
+
+# ====== (Optional) Your old /analyze endpoint for reference ======
+# @app.post("/analyze")
+# async def analyze(
+#     file: UploadFile = File(...),
+#     strategy: str = Form(...),
+#     players: int = Form(...),
+#     current_user: User = Depends(get_current_user)
+# ):
+#     image_data = await file.read()
+#     try:
+#         image = Image.open(io.BytesIO(image_data))
+#     except Exception:
+#         raise HTTPException(status_code=400, detail="Invalid image file.")
+#     b64_image = base64.b64encode(image_data).decode()
+#     # ... rest of your OpenAI code here ...
+#     return {"advice": "OpenAI call would go here"}
+
+# ====== Simple register/login endpoints for token testing ======
 @app.post("/register")
 def register(email: str = Form(...), password: str = Form(...), db: SessionLocal = Depends(get_db)):
     user = get_user(db, email)
@@ -114,122 +131,8 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: SessionLocal = D
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     access_token = create_access_token(
-        data={"sub": user.email}, 
+        data={"sub": user.email},
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
-@app.post("/create-checkout-session")
-def create_checkout_session(db: SessionLocal = Depends(get_db), current_user: User = Depends(get_current_user)):
-    if not current_user.stripe_customer_id:
-        customer = stripe.Customer.create(email=current_user.email)
-        current_user.stripe_customer_id = customer["id"]
-        db.commit()
-    checkout_session = stripe.checkout.Session.create(
-        customer=current_user.stripe_customer_id,
-        payment_method_types=["card"],
-        line_items=[{
-            "price": STRIPE_PRICE_ID,
-            "quantity": 1,
-        }],
-        mode="subscription",
-        success_url="https://yourfrontend.com/success",
-        cancel_url="https://yourfrontend.com/cancel",
-    )
-    return {"checkout_url": checkout_session.url}
-
-@app.post("/webhook")
-async def stripe_webhook(request: Request, db: SessionLocal = Depends(get_db)):
-    payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
-    event = None
-    try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, STRIPE_WEBHOOK_SECRET
-        )
-    except ValueError:
-        return JSONResponse(status_code=400, content={"error": "Invalid payload"})
-    except stripe.error.SignatureVerificationError:
-        return JSONResponse(status_code=400, content={"error": "Invalid signature"})
-
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        customer_id = session.get("customer")
-        if customer_id:
-            user = get_user_by_customer_id(db, customer_id)
-            if user:
-                user.stripe_subscription_status = "active"
-                db.commit()
-    elif event["type"] == "customer.subscription.deleted":
-        subscription = event["data"]["object"]
-        customer_id = subscription.get("customer")
-        if customer_id:
-            user = get_user_by_customer_id(db, customer_id)
-            if user:
-                user.stripe_subscription_status = "inactive"
-                db.commit()
-    return {"status": "success"}
-
-def require_active_subscription(user: User = Depends(get_current_user)):
-    if user.stripe_subscription_status != "active":
-        raise HTTPException(status_code=402, detail="Active subscription required.")
-    return user
-
-# ======= DEBUG FILE UPLOAD ENDPOINT =======
-@app.post("/test-upload")
-async def test_upload(file: UploadFile = File(...)):
-    # Returns file name and size for debugging.
-    data = await file.read()
-    return {"filename": file.filename, "size": len(data)}
-
-# ======= PROTECTED ANALYZE ENDPOINT =======
-@app.post("/analyze")
-async def analyze(
-    file: UploadFile = File(...),
-    strategy: str = Form(...),
-    players: int = Form(...),
-    current_user: User = Depends(require_active_subscription)
-):
-    image_data = await file.read()
-    try:
-        image = Image.open(io.BytesIO(image_data))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid image file.")
-
-    b64_image = base64.b64encode(image_data).decode()
-    prompt = (
-        "You are an expert poker assistant. "
-        "Analyze the provided image of a poker table. Extract my hole cards, suits, community cards, stack sizes, bet amounts, and table situation. "
-        "Always respond in the following format:\n"
-        "- Decision: [e.g., FOLD, BET $500, SHOVE ALL IN]\n"
-        "- Win %: [Give your best estimate, always a number]\n"
-        "- My Cards: [e.g., Ace of Spades, King of Diamonds, etc.]\n"
-        "- Reasoning: [Concise explanation.]\n"
-        f"Adjust advice based on the selected strategy: {strategy}. "
-        f"Assume {players} players at the table. "
-        "If the image is unclear, make your best guess and say so in the reasoning, but ALWAYS give a decision and win %."
-    )
-    try:
-        response = openai.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": [
-                    {"type": "text", "text": "What do I do here?"},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64_image}}
-                ]}
-            ],
-            max_tokens=512,
-        )
-        answer = response.choices[0].message.content.strip()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    return {"advice": answer}
-
-@app.get("/")
-def root():
-    return {"message": "Pokanalyzer API is running."}
-
-@app.get("/hello")
-def hello():
-    return {"hello": "world"}
