@@ -9,7 +9,6 @@ from PIL import Image
 import base64
 import io
 
-# === User Auth Imports ===
 from sqlalchemy import Column, Integer, String, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from passlib.context import CryptContext
@@ -26,8 +25,6 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
 # === FastAPI Setup ===
 app = FastAPI()
-
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -59,11 +56,10 @@ def get_db():
     finally:
         db.close()
 
-# === PASSWORD & JWT SETUP ===
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-SECRET_KEY = "supersecretkey"  # Change for production!
+SECRET_KEY = "supersecretkey"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
@@ -100,8 +96,6 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: SessionLocal = Dep
         raise credentials_exception
     return user
 
-# === USER ENDPOINTS ===
-
 @app.post("/register")
 def register(email: str = Form(...), password: str = Form(...), db: SessionLocal = Depends(get_db)):
     user = get_user(db, email)
@@ -125,16 +119,12 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: SessionLocal = D
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
-# === STRIPE PAYMENT ENDPOINTS ===
-
 @app.post("/create-checkout-session")
 def create_checkout_session(db: SessionLocal = Depends(get_db), current_user: User = Depends(get_current_user)):
-    # Create a customer in Stripe if not already present
     if not current_user.stripe_customer_id:
         customer = stripe.Customer.create(email=current_user.email)
         current_user.stripe_customer_id = customer["id"]
         db.commit()
-
     checkout_session = stripe.checkout.Session.create(
         customer=current_user.stripe_customer_id,
         payment_method_types=["card"],
@@ -143,7 +133,7 @@ def create_checkout_session(db: SessionLocal = Depends(get_db), current_user: Us
             "quantity": 1,
         }],
         mode="subscription",
-        success_url="https://yourfrontend.com/success",  # Update these URLs
+        success_url="https://yourfrontend.com/success",
         cancel_url="https://yourfrontend.com/cancel",
     )
     return {"checkout_url": checkout_session.url}
@@ -153,19 +143,15 @@ async def stripe_webhook(request: Request, db: SessionLocal = Depends(get_db)):
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
     event = None
-
     try:
         event = stripe.Webhook.construct_event(
             payload, sig_header, STRIPE_WEBHOOK_SECRET
         )
-    except ValueError as e:
-        # Invalid payload
+    except ValueError:
         return JSONResponse(status_code=400, content={"error": "Invalid payload"})
-    except stripe.error.SignatureVerificationError as e:
-        # Invalid signature
+    except stripe.error.SignatureVerificationError:
         return JSONResponse(status_code=400, content={"error": "Invalid signature"})
 
-    # Handle subscription events
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
         customer_id = session.get("customer")
@@ -182,23 +168,26 @@ async def stripe_webhook(request: Request, db: SessionLocal = Depends(get_db)):
             if user:
                 user.stripe_subscription_status = "inactive"
                 db.commit()
-    # Add other events as needed
     return {"status": "success"}
-
-# === PAYWALL DECORATOR ===
 
 def require_active_subscription(user: User = Depends(get_current_user)):
     if user.stripe_subscription_status != "active":
         raise HTTPException(status_code=402, detail="Active subscription required.")
     return user
 
-# === PROTECTED ANALYZE ENDPOINT ===
+# ======= DEBUG FILE UPLOAD ENDPOINT =======
+@app.post("/test-upload")
+async def test_upload(file: UploadFile = File(...)):
+    # Returns file name and size for debugging.
+    data = await file.read()
+    return {"filename": file.filename, "size": len(data)}
 
+# ======= PROTECTED ANALYZE ENDPOINT =======
 @app.post("/analyze")
 async def analyze(
     file: UploadFile = File(...),
     strategy: str = Form(...),
-    players: str = Form(...),  # <-- CHANGED FROM int TO str
+    players: int = Form(...),
     current_user: User = Depends(require_active_subscription)
 ):
     image_data = await file.read()
@@ -208,7 +197,6 @@ async def analyze(
         raise HTTPException(status_code=400, detail="Invalid image file.")
 
     b64_image = base64.b64encode(image_data).decode()
-
     prompt = (
         "You are an expert poker assistant. "
         "Analyze the provided image of a poker table. Extract my hole cards, suits, community cards, stack sizes, bet amounts, and table situation. "
@@ -221,7 +209,6 @@ async def analyze(
         f"Assume {players} players at the table. "
         "If the image is unclear, make your best guess and say so in the reasoning, but ALWAYS give a decision and win %."
     )
-
     try:
         response = openai.chat.completions.create(
             model="gpt-4o",
@@ -237,10 +224,7 @@ async def analyze(
         answer = response.choices[0].message.content.strip()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
     return {"advice": answer}
-
-# === TEST ENDPOINTS ===
 
 @app.get("/")
 def root():
