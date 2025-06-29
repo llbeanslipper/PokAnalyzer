@@ -22,6 +22,10 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 # === FastAPI Setup ===
 app = FastAPI()
 
+@app.get("/")
+def root():
+    return {"message": "PokAnalyzer backend is running!"}
+
 # CORS (so your frontend can call this API from anywhere)
 app.add_middleware(
     CORSMiddleware,
